@@ -1,0 +1,48 @@
+# =============================================================================
+# career-news-agent -- sources whitelist
+# -----------------------------------------------------------------------------
+# MVP debug build: only 5 sources are kept here to validate the main pipeline
+#     Firecrawl /map  ->  URL filter  ->  Firecrawl /scrape  ->  Markdown
+#
+# Fields:
+#   name         : Display name of the source.
+#   type         : map (every source uses Firecrawl /map for URL discovery
+#                  at this stage).
+#   url          : Entry point for /map (site root or section root).
+#   default_tag  : Fallback tag; may be overridden later by the LLM
+#                  editorial stage.
+#   url_pattern  : (optional) Python regex applied to every /map result.
+#                  Only links whose URL contains a match are kept. Used to
+#                  drop nav pages, tag/category indexes, social embeds, etc.
+#                  Omit the field to keep every link.
+# =============================================================================
+
+- name: Goldman Sachs Careers Blog
+  type: map
+  url: https://www.goldmansachs.com/careers/blog
+  default_tag: MENTOR
+  url_pattern: ^https?://(?:www\.)?goldmansachs\.com/careers/blog/.+
+
+- name: JPMorgan Insights
+  type: map
+  url: https://www.jpmorgan.com/insights
+  default_tag: MARKET
+  url_pattern: ^https?://(?:www\.)?jpmorgan\.com/insights/.+
+
+- name: Morgan Stanley Insights
+  type: map
+  url: https://www.morganstanley.com/insights
+  default_tag: MARKET
+  url_pattern: ^https?://(?:www\.)?morganstanley\.com/.*insights/.+
+
+- name: Bain Insights
+  type: map
+  url: https://www.bain.com/insights
+  default_tag: REPORT
+  url_pattern: ^https?://(?:www\.)?bain\.com/insights/.+
+
+- name: Levels.fyi Blog
+  type: map
+  url: https://www.levels.fyi/blog
+  default_tag: REPORT
+  url_pattern: ^https?://(?:www\.)?levels\.fyi/blog/.+
