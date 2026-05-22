@@ -16,3 +16,7 @@ if not DEEPSEEK_API_KEY:
 MAX_LINKS = int(os.getenv("MAX_LINKS", "5"))
 if not MAX_LINKS:
     raise SystemExit("MAX_LINKS is not set")
+
+SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "5"))
+if not SCORE_THRESHOLD:
+    raise SystemExit("SCORE_THRESHOLD is not set")
