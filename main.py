@@ -1,22 +1,107 @@
+import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-from settings.config import MAX_LINKS, SCORE_THRESHOLD
+from settings.config import (
+    LLM_MAX_WORKERS,
+    MAP_MAX_WORKERS,
+    MAX_LINKS,
+)
 from crawler import map_sources_from_yaml, scrape_links_to_table
-from raw_process import process_raw_article, score_raw_article
+from raw_process_agent import raw_process_agent
 
-if __name__ == "__main__":
+
+def _scrape_all_sources(map_results: list[dict[str, Any]]) -> list[pd.DataFrame]:
+    """Fan out scrape_links_to_table across sources, bounded by MAP_MAX_WORKERS.
+
+    Total in-flight Firecrawl /scrape calls stay bounded at
+    MAP_MAX_WORKERS * SCRAPE_MAX_WORKERS.
+    """
+    if not map_results:
+        return []
+    outer_workers = max(1, min(MAP_MAX_WORKERS, len(map_results)))
+    with ThreadPoolExecutor(max_workers=outer_workers) as ex:
+        return list(ex.map(scrape_links_to_table, map_results))
+
+
+async def _process_one(
+    row: dict[str, Any],
+    sem: asyncio.Semaphore,
+) -> dict[str, Any]:
+    """Run raw_process_agent on one row; never raise.
+
+    The returned record is the article's full AgentState plus the YAML-side
+    metadata (default_tag, source_url landing page) that the agent does not
+    carry. This is the canonical row shape for the eventual DB table.
+    """
+    initial_state: dict[str, Any] = {
+        "article_url": row["article_url"],
+        "source_name": row.get("source_name", ""),
+        "raw_markdown": row["markdown"],
+        "scraped_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    async with sem:
+        try:
+            final_state: dict[str, Any] = await raw_process_agent.ainvoke(initial_state)
+        except Exception as exc:
+            # Each node catches its own LLM errors into stage_errors. This
+            # branch is the last-resort net for things like graph wiring bugs
+            # or OOM: we still record the article so it isn't silently lost.
+            final_state = {
+                **initial_state,
+                "stage_errors": [{"node": "ainvoke", "error": str(exc)}],
+            }
+
+    return {
+        **final_state,
+        "default_tag": row.get("default_tag", ""),
+        "source_url": row.get("source_url", ""),
+    }
+
+
+async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Run the agent on every row in parallel, capped by LLM_MAX_WORKERS."""
+    if not rows:
+        return []
+
+    sem = asyncio.Semaphore(max(1, LLM_MAX_WORKERS))
+    tasks = [asyncio.create_task(_process_one(row, sem)) for row in rows]
+
+    records: list[dict[str, Any]] = []
+    total = len(tasks)
+    for idx, fut in enumerate(asyncio.as_completed(tasks), start=1):
+        record = await fut
+        url = record.get("article_url", "<unknown>")
+        errs = record.get("stage_errors") or []
+        if errs:
+            err_nodes = ",".join(e.get("node", "?") for e in errs)
+            print(f"[done {idx}/{total}] {url} -> errors=[{err_nodes}]")
+        else:
+            overall = record.get("overall_score", "?")
+            needs_rev = record.get("needs_revision", "?")
+            print(
+                f"[done {idx}/{total}] {url} -> overall={overall} "
+                f"needs_revision={needs_rev}"
+            )
+        records.append(record)
+    return records
+
+
+async def main_async() -> None:
     run_output_dir = Path("output") / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Demo pipeline: yaml -> map_sources_from_yaml -> scrape_links_to_table.
-    # Note: each source fires up to `limit` /scrape calls -- mind the Firecrawl quota.
+    # YAML -> map_sources_from_yaml -> scrape_links_to_table.
+    # Each source fires up to `limit` /scrape calls -- mind the Firecrawl quota.
     map_results = map_sources_from_yaml(limit=MAX_LINKS)
+    dfs = _scrape_all_sources(map_results)
 
-    dfs = [scrape_links_to_table(r) for r in map_results]
     df = (
         pd.concat(dfs, ignore_index=True)
         if dfs
@@ -29,78 +114,26 @@ if __name__ == "__main__":
         ])
     )
 
-    # P1.9: drop rows whose scrape failed or returned an empty body so the
-    # LLM stage never sees a None/"" markdown.
+    # Drop rows whose scrape failed or returned an empty body so the LLM
+    # stage never sees a None/"" markdown.
     df = df.dropna(subset=["markdown"])
     df = df[df["markdown"].astype(str).str.len() > 0].reset_index(drop=True)
 
     print(f"\nfinal table shape: {df.shape}")
     print(df.head())
 
-    score_rows = []
-    outputs = []
+    rows = df.to_dict("records")
+    records = await _process_all(rows)
 
-    for _, row in df.iterrows():
-        print(f"Scoring article: {row['article_url']}")
-
-        try:
-            score = score_raw_article(
-                article_url=row["article_url"],
-                source_name=row["source_name"],
-                default_tag=row["default_tag"],
-                raw_article=row["markdown"],
-            )
-        except Exception as e:
-            print(f"[score failed] {row['article_url']}: {e}")
-            score_rows.append({
-                "article_url":     row["article_url"],
-                "relevance_score": None,
-                "quality_score":   None,
-                "overall_score":   None,
-                "reason":          f"ERROR: {e}",
-                "raw_markdown":    row["markdown"],
-            })
-            continue
-
-        print("================================================")
-        print(score.model_dump_json(indent=2))
-        print("================================================")
-
-        score_rows.append({
-            "article_url": row["article_url"],
-            "relevance_score": score.relevance_score,
-            "quality_score": score.quality_score,
-            "overall_score": score.overall_score,
-            "reason": score.reason,
-            "raw_markdown": row["markdown"],
-        })
-
-        if score.overall_score < SCORE_THRESHOLD:
-            continue
-
-        output = process_raw_article(
-            article_url=row["article_url"],
-            raw_article=row["markdown"],
-            source_name=row["source_name"],
-            default_tag=row["default_tag"],
-        )
-        print("================================================")
-        print(output.model_dump_json(indent=2))
-        print("================================================")
-
-        outputs.append(output.model_dump(mode="json"))
-
-    scores_path = run_output_dir / "score_rows.json"
-    outputs_path = run_output_dir / "outputs.json"
-
-    scores_path.write_text(
-        json.dumps(score_rows, ensure_ascii=False, indent=2),
+    # Keep ALL articles -- no SCORE_THRESHOLD filtering -- so low-scoring
+    # references can still be inspected and revisited downstream.
+    articles_path = run_output_dir / "articles.json"
+    articles_path.write_text(
+        json.dumps(records, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    outputs_path.write_text(
-        json.dumps(outputs, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    print(f"\nSaved {len(records)} articles to: {articles_path}")
 
-    print(f"Saved score rows to: {scores_path}")
-    print(f"Saved processed outputs to: {outputs_path}")
+
+if __name__ == "__main__":
+    asyncio.run(main_async())
