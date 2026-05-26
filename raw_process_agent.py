@@ -1,13 +1,46 @@
 import operator
 from typing import Annotated, TypedDict
 
+from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from llm import get_base_model
+from logger import pipeline_logger
 from settings.config import SCORE_CRITERIA
+
+
+def _with_callbacks(
+    config: RunnableConfig | None,
+    extra: list[BaseCallbackHandler],
+) -> RunnableConfig:
+    """Return a copy of ``config`` with ``extra`` callbacks added.
+
+    LangGraph hands each node a RunnableConfig whose ``callbacks`` field is
+    an AsyncCallbackManager (not a list). We must keep that manager around
+    so parent runs stay tracked, but we cannot just drop a handler into
+    the same list as a manager -- LangChain would later try to call
+    ``handler.run_inline`` on the manager and crash with
+    ``'AsyncCallbackManager' object has no attribute 'run_inline'``.
+
+    Branches:
+        - manager  -> copy it and ``add_handler`` for each extra
+        - list     -> concatenate
+        - missing  -> just use ``extra``
+    """
+    base: dict = dict(config or {})
+    existing = base.get("callbacks")
+    if isinstance(existing, BaseCallbackManager):
+        manager = existing.copy()
+        for h in extra:
+            manager.add_handler(h, inherit=True)
+        base["callbacks"] = manager
+    else:
+        existing_list = list(existing) if existing else []
+        base["callbacks"] = [*existing_list, *extra]
+    return base  # type: ignore[return-value]
 
 
 # --------------------- Agent State ---------------------
@@ -110,13 +143,14 @@ async def extract(state: AgentState, config: RunnableConfig) -> dict:
 
     model = get_base_model().with_structured_output(Extraction)
     try:
-        result: Extraction = await model.ainvoke(
-            [
-                SystemMessage(content=EXTRACT_SYSTEM_PROMPT),
-                HumanMessage(content=user_msg),
-            ],
-            config=config,
-        )
+        async with pipeline_logger.track_llm("extract") as cbs:
+            result: Extraction = await model.ainvoke(
+                [
+                    SystemMessage(content=EXTRACT_SYSTEM_PROMPT),
+                    HumanMessage(content=user_msg),
+                ],
+                config=_with_callbacks(config, cbs),
+            )
     except Exception as exc:
         return {"stage_errors": [{"node": "extract", "error": str(exc)}]}
 
@@ -169,13 +203,14 @@ async def score(state: AgentState, config: RunnableConfig) -> dict:
 
     model = get_base_model().with_structured_output(Score)
     try:
-        result: Score = await model.ainvoke(
-            [
-                SystemMessage(content=SCORE_SYSTEM_PROMPT),
-                HumanMessage(content=user_msg),
-            ],
-            config=config,
-        )
+        async with pipeline_logger.track_llm("score") as cbs:
+            result: Score = await model.ainvoke(
+                [
+                    SystemMessage(content=SCORE_SYSTEM_PROMPT),
+                    HumanMessage(content=user_msg),
+                ],
+                config=_with_callbacks(config, cbs),
+            )
     except Exception as exc:
         return {"stage_errors": [{"node": "score", "error": str(exc)}]}
 
@@ -282,13 +317,14 @@ async def review(state: AgentState, config: RunnableConfig) -> dict:
 
     model = get_base_model().with_structured_output(ReviewedExtraction)
     try:
-        result: ReviewedExtraction = await model.ainvoke(
-            [
-                SystemMessage(content=REVIEW_SYSTEM_PROMPT),
-                HumanMessage(content=user_msg),
-            ],
-            config=config,
-        )
+        async with pipeline_logger.track_llm("review") as cbs:
+            result: ReviewedExtraction = await model.ainvoke(
+                [
+                    SystemMessage(content=REVIEW_SYSTEM_PROMPT),
+                    HumanMessage(content=user_msg),
+                ],
+                config=_with_callbacks(config, cbs),
+            )
     except Exception as exc:
         return {"stage_errors": [{"node": "review", "error": str(exc)}]}
 

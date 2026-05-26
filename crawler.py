@@ -8,6 +8,7 @@ import yaml
 from dotenv import load_dotenv
 from firecrawl import Firecrawl
 
+from logger import pipeline_logger
 from settings.config import (
     FIRECRAWL_API_KEY,
     MAP_MAX_WORKERS,
@@ -69,7 +70,6 @@ def map_sources_from_yaml(
                 "source": {
                     "name":         str,
                     "url":          str,   # landing page from YAML
-                    "default_tag":  str,
                     "url_pattern":  str | None,
                 },
                 "links": list[str],  # already filtered by url_pattern + ext
@@ -93,7 +93,6 @@ def map_sources_from_yaml(
         valid_sources.append({
             "name": src.get("name", ""),
             "url": url,
-            "default_tag": src.get("default_tag", ""),
             "url_pattern": src.get("url_pattern"),
         })
 
@@ -107,7 +106,8 @@ def map_sources_from_yaml(
 
         print(f"[mapping] {name}: {url}")
         try:
-            r = firecrawl.map(url=url, limit=limit)
+            with pipeline_logger.time_block("map"):
+                r = firecrawl.map(url=url, limit=limit)
         except Exception as exc:
             print(f"[map failed] {url}: {exc}")
             return None
@@ -121,7 +121,6 @@ def map_sources_from_yaml(
             "source": {
                 "name": name,
                 "url": url,
-                "default_tag": src["default_tag"],
                 "url_pattern": url_pattern,
             },
             "links": links,
@@ -147,7 +146,6 @@ def scrape_links_to_table(
         DataFrame with the columns:
             - source_name : Display name from YAML.
             - source_url  : Landing-page URL from YAML.
-            - default_tag : Fallback tag from YAML (used by the LLM stage).
             - article_url : The scraped page URL.
             - markdown    : Markdown body from Firecrawl (None on failure).
 
@@ -160,7 +158,6 @@ def scrape_links_to_table(
     columns = [
         "source_name",
         "source_url",
-        "default_tag",
         "article_url",
         "markdown",
     ]
@@ -170,7 +167,8 @@ def scrape_links_to_table(
 
     def _scrape_one(url: str) -> dict[str, Any]:
         try:
-            doc = firecrawl.scrape(url=url)
+            with pipeline_logger.time_block("scrape"):
+                doc = firecrawl.scrape(url=url)
             markdown = getattr(doc, "markdown", None)
         except Exception as exc:
             print(f"[scrape failed] {url}: {exc}")
@@ -179,7 +177,6 @@ def scrape_links_to_table(
         return {
             "source_name": source["name"],
             "source_url":  source["url"],
-            "default_tag": source["default_tag"],
             "article_url": url,
             "markdown":    markdown,
         }

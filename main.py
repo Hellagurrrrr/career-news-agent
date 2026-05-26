@@ -13,6 +13,7 @@ from settings.config import (
     MAX_LINKS,
 )
 from crawler import map_sources_from_yaml, scrape_links_to_table
+from logger import pipeline_logger
 from raw_process_agent import raw_process_agent
 
 
@@ -36,8 +37,8 @@ async def _process_one(
     """Run raw_process_agent on one row; never raise.
 
     The returned record is the article's full AgentState plus the YAML-side
-    metadata (default_tag, source_url landing page) that the agent does not
-    carry. This is the canonical row shape for the eventual DB table.
+    metadata (source_url landing page) that the agent does not carry. This
+    is the canonical row shape for the eventual DB table.
     """
     initial_state: dict[str, Any] = {
         "article_url": row["article_url"],
@@ -60,7 +61,6 @@ async def _process_one(
 
     return {
         **final_state,
-        "default_tag": row.get("default_tag", ""),
         "source_url": row.get("source_url", ""),
     }
 
@@ -108,7 +108,6 @@ async def main_async() -> None:
         else pd.DataFrame(columns=[
             "source_name",
             "source_url",
-            "default_tag",
             "article_url",
             "markdown",
         ])
@@ -133,6 +132,12 @@ async def main_async() -> None:
         encoding="utf-8",
     )
     print(f"\nSaved {len(records)} articles to: {articles_path}")
+
+    # Per-stage timings + token usage for this run. Printed for quick
+    # inspection and also persisted next to articles.json.
+    pipeline_logger.print_summary()
+    metrics_path = pipeline_logger.save(run_output_dir / "metrics.json")
+    print(f"Saved pipeline metrics to: {metrics_path}")
 
 
 if __name__ == "__main__":
