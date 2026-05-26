@@ -64,6 +64,10 @@ class AgentState(TypedDict, total=False):
     read_minutes: int
     notes: str
 
+    # === generate tag node output ===
+    tag: str
+    tag_reason: str
+
     # === score node output ===
     relevance_score: int
     quality_score: int
@@ -156,8 +160,64 @@ async def extract(state: AgentState, config: RunnableConfig) -> dict:
 
     return result.model_dump()
 
+# --------------------- Node 2: Generate Tag---------------------
+class GenerateTag(BaseModel):
+    tag: str = Field(
+        description="The tag of the article"
+    )
+    tag_reason: str = Field(
+        description="The reason for the tag"
+    )
 
-# --------------------- Node 2: Scoring ---------------------
+
+GENERATE_TAG_SYSTEM_PROMPT = """You are an expert at generating a tag for an article.
+You will be given the excerpt of the article. Generate the following structured fields:
+
+- Tag: the tag of the article, should strictly be one of the followings:
+    - MARKET: The "market conditions" of the recruitment market. 
+    For example, the recruitment pace of tech giants in Q2 and the segmented recruitment 
+    of hedge funds on campus, which belong to macro/meta-level industry trend observations.
+
+    - MENTOR: First-person experience articles from current mentors in the industry, 
+    such as letters from Goldman Sachs IBD and McKinsey EM, which focus on personal know-how.
+
+    - REPORT: Structured data reports, such as the "2026 White Paper on Job Seeking for 
+    International Students" and the "Comprehensive Report on Careers for Female International Students," 
+    emphasize sample size and research dimensions, and are research content produced in-house by the community.
+
+    - VISA:  Policy and compliance related content, such as new H-1B lottery rules.
+
+    - CITY: Life/job-seeking guides centered around individual work cities, such as London and New York. 
+    Focus on lifestyle/local information.
+
+- Tag Reason: the reason for the tag, should be concise and to the point.
+
+Rules:
+- The tag should be one of the followings: MARKET, MENTOR, REPORT, VISA, CITY.
+- The tag reason should be concise and to the point.
+"""
+
+async def generate_tag(state: AgentState, config: RunnableConfig) -> dict:
+    """Generate a tag for the article."""
+    user_msg = f"<EXCERPT_EN>{state['excerpt_en']}</EXCERPT_EN>"
+
+    model = get_base_model().with_structured_output(GenerateTag)
+    try:
+        async with pipeline_logger.track_llm("generate_tag") as cbs:
+            result: GenerateTag = await model.ainvoke(
+                [
+                    SystemMessage(content=GENERATE_TAG_SYSTEM_PROMPT),
+                    HumanMessage(content=user_msg),
+                ],
+                config=_with_callbacks(config, cbs),
+            )
+    except Exception as exc:
+        return {"stage_errors": [{"node": "generate_tag", "error": str(exc)}]}
+
+    return result.model_dump()
+
+
+# --------------------- Node 3: Scoring ---------------------
 class Score(BaseModel):
     relevance_score: int = Field(
         ge=0, le=10, description="Relevance score, 0-10 inclusive"
@@ -226,7 +286,7 @@ async def score(state: AgentState, config: RunnableConfig) -> dict:
     }
 
 
-# --------------------- Node 3: Review ---------------------
+# --------------------- Node 4: Review ---------------------
 class ReviewedExtraction(BaseModel):
     title_zh: str = Field(
         description="Reviewed/corrected title in Chinese"
