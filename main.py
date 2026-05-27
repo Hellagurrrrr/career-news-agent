@@ -7,14 +7,15 @@ from typing import Any
 
 import pandas as pd
 
+import db
+from crawler import map_sources_from_yaml, scrape_links_to_table
+from logger import pipeline_logger
+from raw_process_agent import raw_process_agent
 from settings.config import (
     LLM_MAX_WORKERS,
     MAP_MAX_WORKERS,
     MAX_LINKS,
 )
-from crawler import map_sources_from_yaml, scrape_links_to_table
-from logger import pipeline_logger
-from raw_process_agent import raw_process_agent
 
 
 def _scrape_all_sources(map_results: list[dict[str, Any]]) -> list[pd.DataFrame]:
@@ -30,15 +31,40 @@ def _scrape_all_sources(map_results: list[dict[str, Any]]) -> list[pd.DataFrame]
         return list(ex.map(scrape_links_to_table, map_results))
 
 
+def _dedup_against_db(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hash every scraped row and drop the ones already present in the DB.
+
+    Mutates each row in-place to attach ``hash_code``; the agent stage
+    later carries that hash through to the final record so we can persist
+    it without recomputing.
+    """
+    if not rows:
+        return []
+    for row in rows:
+        row["hash_code"] = db.compute_hash(row["article_url"])
+
+    already = db.existing_hashes(row["hash_code"] for row in rows)
+    new_rows = [r for r in rows if r["hash_code"] not in already]
+
+    total = len(rows)
+    skipped = total - len(new_rows)
+    print(
+        f"\n[dedup] {total} scraped | {skipped} already in DB | "
+        f"{len(new_rows)} new -> agent"
+    )
+    return new_rows
+
+
 async def _process_one(
     row: dict[str, Any],
     sem: asyncio.Semaphore,
 ) -> dict[str, Any]:
     """Run raw_process_agent on one row; never raise.
 
-    The returned record is the article's full AgentState plus the YAML-side
-    metadata (source_url landing page) that the agent does not carry. This
-    is the canonical row shape for the eventual DB table.
+    The returned record is the article's full AgentState plus the
+    pipeline-managed metadata that the agent itself does not carry
+    (source_url landing page, hash_code). This is the canonical row
+    shape consumed by db.insert_article().
     """
     initial_state: dict[str, Any] = {
         "article_url": row["article_url"],
@@ -62,11 +88,16 @@ async def _process_one(
     return {
         **final_state,
         "source_url": row.get("source_url", ""),
+        "hash_code": row["hash_code"],
     }
 
 
 async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Run the agent on every row in parallel, capped by LLM_MAX_WORKERS."""
+    """Run the agent on every row in parallel, capped by LLM_MAX_WORKERS.
+
+    Each completed record is inserted into the DB immediately, so a crash
+    later in the run never loses already-processed articles.
+    """
     if not rows:
         return []
 
@@ -89,6 +120,18 @@ async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 f"[done {idx}/{total}] {url} -> overall={overall} "
                 f"needs_revision={needs_rev}"
             )
+
+        # Persist immediately. We catch IntegrityError separately so a
+        # race between two concurrent runs picking the same article does
+        # not crash the whole batch.
+        try:
+            unique_id = db.insert_article(record)
+            record["unique_id"] = unique_id
+            record["status"] = db.ArticleStatus.REVIEWING.value
+            print(f"[db] inserted {unique_id} status=REVIEWING")
+        except Exception as exc:
+            print(f"[db insert failed] {url}: {exc}")
+
         records.append(record)
     return records
 
@@ -96,6 +139,9 @@ async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 async def main_async() -> None:
     run_output_dir = Path("output") / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Idempotent: creates table+indexes on first run, no-op afterwards.
+    db.init_db()
 
     # YAML -> map_sources_from_yaml -> scrape_links_to_table.
     # Each source fires up to `limit` /scrape calls -- mind the Firecrawl quota.
@@ -121,17 +167,22 @@ async def main_async() -> None:
     print(f"\nfinal table shape: {df.shape}")
     print(df.head())
 
+    # Hash + dedup BEFORE the agent so we never spend tokens on articles
+    # we have already processed.
     rows = df.to_dict("records")
-    records = await _process_all(rows)
+    new_rows = _dedup_against_db(rows)
 
-    # Keep ALL articles -- no SCORE_THRESHOLD filtering -- so low-scoring
-    # references can still be inspected and revisited downstream.
+    records = await _process_all(new_rows)
+
+    # Per-run snapshot of newly-processed articles. The DB is the canonical
+    # store; this JSON makes it easy to eyeball one run's output without
+    # opening sqlite.
     articles_path = run_output_dir / "articles.json"
     articles_path.write_text(
         json.dumps(records, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"\nSaved {len(records)} articles to: {articles_path}")
+    print(f"\nSaved {len(records)} new articles to: {articles_path}")
 
     # Per-stage timings + token usage for this run. Printed for quick
     # inspection and also persisted next to articles.json.

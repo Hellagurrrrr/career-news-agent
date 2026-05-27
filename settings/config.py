@@ -17,6 +17,11 @@ MAX_LINKS = int(os.getenv("MAX_LINKS", "5"))
 
 SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "5"))
 
+# Persistent SQLite store for processed articles. Path is relative to the
+# project root unless overridden via env. We deliberately keep it OUTSIDE
+# the per-run output/ directory because it accumulates across runs.
+DB_PATH = os.getenv("DB_PATH", "articles.db")
+
 # Concurrency knobs for the I/O-bound pipeline stages. All external calls
 # (Firecrawl /map, Firecrawl /scrape, DeepSeek LLM) are network-bound, so a
 # small thread pool gives a big speedup. Tune these via env vars if Firecrawl
