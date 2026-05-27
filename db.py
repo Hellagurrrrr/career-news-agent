@@ -43,6 +43,32 @@ class ArticleStatus(str, Enum):
     DISCARD = "DISCARD"
 
 
+class ArticleTag(str, Enum):
+    """Content tag for an article row.
+
+    The pipeline (raw_process_agent.generate_tag) chooses one of these per
+    article; admins can later override the value via update_tag().
+
+    MARKET: macro/meta-level industry trend observations on the recruitment
+            market (e.g. tech giants' Q2 hiring pace, hedge-fund campus
+            recruiting cadence).
+    MENTOR: first-person know-how from current industry mentors (e.g. a
+            Goldman IBD analyst's letter, a McKinsey EM's playbook).
+    REPORT: in-house structured data reports emphasizing sample size and
+            research dimensions (e.g. the 2026 International Student Job
+            Seeking White Paper).
+    VISA:   policy / compliance content (e.g. new H-1B lottery rules).
+    CITY:   life and job-seeking guides centered on a single work city
+            (e.g. London, New York), focused on lifestyle / local info.
+    """
+
+    MARKET = "MARKET"
+    MENTOR = "MENTOR"
+    REPORT = "REPORT"
+    VISA = "VISA"
+    CITY = "CITY"
+
+
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
     unique_id       TEXT PRIMARY KEY,
@@ -66,7 +92,8 @@ CREATE TABLE IF NOT EXISTS articles (
     read_minutes    INTEGER,
     notes           TEXT,
 
-    tag             TEXT,
+    tag             TEXT
+                       CHECK(tag IS NULL OR tag IN ('MARKET','MENTOR','REPORT','VISA','CITY')),
     tag_reason      TEXT,
 
     relevance_score INTEGER,
@@ -87,6 +114,7 @@ CREATE TABLE IF NOT EXISTS articles (
 _CREATE_INDEX_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_articles_hash   ON articles(hash_code);",
     "CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);",
+    "CREATE INDEX IF NOT EXISTS idx_articles_tag    ON articles(tag);",
     "CREATE INDEX IF NOT EXISTS idx_articles_url    ON articles(article_url);",
 ]
 
@@ -244,4 +272,26 @@ def update_status(unique_id: str, status: ArticleStatus | str) -> None:
         conn.execute(
             "UPDATE articles SET status = ?, updated_at = ? WHERE unique_id = ?",
             (status.value, now, unique_id),
+        )
+
+
+def update_tag(unique_id: str, tag: ArticleTag | str | None) -> None:
+    """Admin op: re-tag an article (e.g. correcting the LLM's choice).
+
+    Accepts an ``ArticleTag``, the raw string (validated against the enum
+    so we don't bypass safety by hitting only the CHECK constraint), or
+    ``None`` to clear the tag.
+    """
+    if tag is None:
+        value: str | None = None
+    else:
+        if isinstance(tag, str):
+            tag = ArticleTag(tag)
+        value = tag.value
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = _get_conn()
+    with conn:
+        conn.execute(
+            "UPDATE articles SET tag = ?, updated_at = ? WHERE unique_id = ?",
+            (value, now, unique_id),
         )

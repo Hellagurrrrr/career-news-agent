@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from db import ArticleTag
 from llm import get_base_model
 from logger import pipeline_logger
 from settings.config import SCORE_CRITERIA
@@ -65,6 +66,10 @@ class AgentState(TypedDict, total=False):
     notes: str
 
     # === generate tag node output ===
+    # ``tag`` is one of ArticleTag's values (MARKET/MENTOR/REPORT/VISA/CITY).
+    # We keep the runtime type as ``str`` because pydantic dumps the enum
+    # to its string value before it lands here, and that string is also
+    # what the DB CHECK constraint validates against.
     tag: str
     tag_reason: str
 
@@ -162,8 +167,11 @@ async def extract(state: AgentState, config: RunnableConfig) -> dict:
 
 # --------------------- Node 2: Generate Tag---------------------
 class GenerateTag(BaseModel):
-    tag: str = Field(
-        description="The tag of the article"
+    tag: ArticleTag = Field(
+        description=(
+            "The tag of the article. Must be exactly one of: "
+            "MARKET, MENTOR, REPORT, VISA, CITY."
+        )
     )
     tag_reason: str = Field(
         description="The reason for the tag"
@@ -395,11 +403,13 @@ async def review(state: AgentState, config: RunnableConfig) -> dict:
 agent = StateGraph(AgentState)
 agent.add_node("extract", extract)
 agent.add_node("score", score)
+agent.add_node("generate_tag", generate_tag)
 agent.add_node("review", review)
 
 agent.set_entry_point("extract")
 agent.add_edge("extract", "score")
-agent.add_edge("score", "review")
+agent.add_edge("score", "generate_tag")
+agent.add_edge("generate_tag", "review")
 agent.add_edge("review", END)
 
 raw_process_agent = agent.compile()
