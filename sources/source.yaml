@@ -39,3 +39,88 @@
   type: map
   url: https://www.levels.fyi/blog
   url_pattern: ^https?://(?:www\.)?levels\.fyi/blog/.+
+
+- name: Citi Insights
+  type: map
+  url: https://www.citigroup.com/global/insights
+  url_pattern: ^https?://(?:www\.)?citigroup\.com/global/insights/.+
+
+- name: Barclays Insights
+  type: map
+  url: https://www.barclays.com/insights
+  url_pattern: ^https?://(?:www\.)?barclays\.com/.*insights/.+
+
+- name: HSBC News and views
+  type: map
+  url: https://www.hsbc.com/news-and-views/views/hsbc-views
+  url_pattern: ^https?://(?:www\.)?hsbc\.com/news-and-views/views/hsbc-views/.+
+
+- name: Lazard Insights
+  type: map
+  url: https://www.lazard.com/research-insights
+  url_pattern: ^https?://(?:www\.)?lazard\.com/research-insights/.+
+
+- name: McKinsey Insights
+  type: map
+  url: https://www.mckinsey.com/featured-insights
+  url_pattern: ^https?://(?:www\.)?mckinsey\.com/(?:featured-insights|industries|capabilities)/.+
+
+- name: BCG Insights
+  type: map
+  url: https://www.bcg.com/publications
+  url_pattern: ^https?://(?:www\.)?bcg\.com/publications/.+
+
+- name: Deloitte Insights
+  type: map
+  url: https://www2.deloitte.com/us/en/insights.html
+  url_pattern: ^https?://www2\.deloitte\.com/.+/insights/.+\.html$
+
+- name: PwC Insights - AI, data and tech
+  type: map
+  url: https://www.pwc.com/gx/en/issues/technology.html
+  url_pattern: ^https?://(?:www\.)?pwc\.com/gx/en/issues/technology[/-].+
+
+- name: PwC Insights - Reinvention
+  type: map
+  url: https://www.pwc.com/gx/en/issues/business-model-reinvention.html
+  url_pattern: ^https?://(?:www\.)?pwc\.com/gx/en/issues/business-model-reinvention[/-].+
+
+- name: PwC Insights - Transformation
+  type: map
+  url: https://www.pwc.com/gx/en/issues/transformation.html
+  url_pattern: ^https?://(?:www\.)?pwc\.com/gx/en/issues/transformation[/-].+
+
+- name: Meta Careers Blog
+  type: map
+  url: https://www.metacareers.com/blog/search-results/?format=blog_article
+  url_pattern: ^https?://(?:www\.)metacareers\.com/blog/.+
+
+- name: Microsoft AI News
+  type: map
+  url: https://news.microsoft.com/source/tag/ai/
+  url_pattern: ^https?://news\.microsoft\.com/source/.+
+
+- name: USCIS Newsroom
+  type: map
+  url: https://www.uscis.gov/newsroom/all-news
+  url_pattern: ^https?://(?:www\.)?uscis\.gov/newsroom/.+
+
+- name: Time Out London
+  type: map
+  url: https://www.timeout.com/london/news
+  url_pattern: ^https?://(?:www\.)?timeout\.com/london/.+
+
+- name: Time Out New York
+  type: map
+  url: https://www.timeout.com/newyork/news
+  url_pattern: ^https?://(?:www\.)?timeout\.com/newyork/.+
+
+- name: Time Out Hong Kong
+  type: map
+  url: https://www.timeout.com/hong-kong
+  url_pattern: ^https?://(?:www\.)?timeout\.com/hong-kong/.+
+
+- name: Time Out Singapore
+  type: map
+  url: https://www.timeout.com/singapore
+  url_pattern: ^https?://(?:www\.)?timeout\.com/singapore/.+

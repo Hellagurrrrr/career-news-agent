@@ -1,7 +1,8 @@
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import pandas as pd
 import yaml
@@ -24,6 +25,48 @@ _NON_ARTICLE_EXT = re.compile(
     r"\.(pdf|jpe?g|png|gif|svg|webp|mp4|webm|mp3|zip)(?:\?.*)?$",
     re.IGNORECASE,
 )
+
+# Firecrawl signals rate limiting with a string like:
+#   "Rate Limit Exceeded: ... please retry after 60s, resets at ..."
+# We parse "retry after Xs" to know exactly how long to back off.
+_RATE_LIMIT_HINT = re.compile(r"retry after (\d+)\s*s", re.IGNORECASE)
+_RATE_LIMIT_MARK = re.compile(r"rate limit", re.IGNORECASE)
+
+T = TypeVar("T")
+
+
+def _call_with_rate_limit_retry(
+    fn: Callable[[], T],
+    *,
+    label: str,
+    max_retries: int = 3,
+    fallback_sleep: float = 60.0,
+    extra_pad: float = 2.0,
+) -> T:
+    """Call a Firecrawl SDK function, retrying on rate-limit errors.
+
+    On a rate-limit error we honour the API's "retry after Xs" hint
+    (plus a small safety pad), sleep, then retry. Non-rate-limit
+    errors are re-raised immediately so the caller's normal error
+    path still kicks in. After ``max_retries`` we also re-raise.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as exc:
+            msg = str(exc)
+            if not _RATE_LIMIT_MARK.search(msg) or attempt >= max_retries:
+                raise
+            m = _RATE_LIMIT_HINT.search(msg)
+            wait = float(m.group(1)) if m else fallback_sleep
+            wait += extra_pad
+            attempt += 1
+            print(
+                f"[rate-limit] {label}: sleeping {wait:.0f}s "
+                f"(attempt {attempt}/{max_retries})"
+            )
+            time.sleep(wait)
 
 
 def _filter_article_urls(
@@ -107,12 +150,37 @@ def map_sources_from_yaml(
         print(f"[mapping] {name}: {url}")
         try:
             with pipeline_logger.time_block("map"):
-                r = firecrawl.map(url=url, limit=limit)
+                r = _call_with_rate_limit_retry(
+                    lambda: firecrawl.map(url=url, limit=limit),
+                    label=f"map {name}",
+                )
         except Exception as exc:
             print(f"[map failed] {url}: {exc}")
             return None
 
         links = _filter_article_urls(r.links, url, url_pattern)
+
+        # Fallback for SPA / JS-rendered content hubs: the default /map mostly
+        # reads static HTML, so it often returns 0-1 useful link for sites
+        # like PwC, Deloitte, or Microsoft News. When we got no kept links,
+        # retry with sitemap="only" which forces Firecrawl to read the site's
+        # sitemap.xml -- typically yields the real article URLs.
+        if not links:
+            print(f"[map fallback] {name}: trying sitemap-only mode")
+            try:
+                with pipeline_logger.time_block("map"):
+                    r = _call_with_rate_limit_retry(
+                        lambda: firecrawl.map(
+                            url=url,
+                            limit=limit,
+                            sitemap="only",
+                        ),
+                        label=f"map(sitemap) {name}",
+                    )
+                links = _filter_article_urls(r.links, url, url_pattern)
+            except Exception as exc:
+                print(f"[map fallback failed] {url}: {exc}")
+
         print(
             f"[mapped] {name}: discovered {len(r.links)} links, "
             f"kept {len(links)} after filter"
@@ -168,7 +236,10 @@ def scrape_links_to_table(
     def _scrape_one(url: str) -> dict[str, Any]:
         try:
             with pipeline_logger.time_block("scrape"):
-                doc = firecrawl.scrape(url=url)
+                doc = _call_with_rate_limit_retry(
+                    lambda: firecrawl.scrape(url=url),
+                    label=f"scrape {url}",
+                )
             markdown = getattr(doc, "markdown", None)
         except Exception as exc:
             print(f"[scrape failed] {url}: {exc}")
