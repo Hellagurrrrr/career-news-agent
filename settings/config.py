@@ -15,8 +15,6 @@ if not DEEPSEEK_API_KEY:
 # get parameters
 MAX_LINKS = int(os.getenv("MAX_LINKS", "5"))
 
-SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "5"))
-
 # Persistent SQLite store for processed articles. Path is relative to the
 # project root unless overridden via env. We deliberately keep it OUTSIDE
 # the per-run output/ directory because it accumulates across runs.
@@ -30,6 +28,12 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 if not NOTION_TOKEN:
     raise SystemExit("NOTION_TOKEN is not set")
 NOTION_DB_ID = os.getenv("NOTION_DB_ID")
+# Notion API 2025-09-03 split each database into a container + one or more
+# child "data sources". Reads/writes against rows now target the data
+# source, not the database. For single-source DBs (the common case) we
+# auto-resolve this from NOTION_DB_ID; set NOTION_DS_ID explicitly only if
+# your DB has multiple data sources and you need to pin a specific one.
+NOTION_DS_ID = os.getenv("NOTION_DS_ID")
 NOTION_SYNC_ENABLED = bool(NOTION_TOKEN and NOTION_DB_ID)
 
 # Concurrency knobs for the I/O-bound pipeline stages. All external calls
@@ -40,9 +44,7 @@ MAP_MAX_WORKERS = int(os.getenv("MAP_MAX_WORKERS", "4"))
 SCRAPE_MAX_WORKERS = int(os.getenv("SCRAPE_MAX_WORKERS", "8"))
 LLM_MAX_WORKERS = int(os.getenv("LLM_MAX_WORKERS", "6"))
 
-REASON_MAX_LEN = 800
-REASON_MIN_LEN = 100
-
+# score criteria for scoring agent node 2
 SCORE_CRITERIA = """
 relevance_score rubric (0-10):
 - 9-10: Directly useful for the audience and focused on one or more core

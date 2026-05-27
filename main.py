@@ -129,6 +129,10 @@ async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             unique_id = db.insert_article(record)
             record["unique_id"] = unique_id
             record["status"] = db.ArticleStatus.REVIEWING.value
+            # Mirror the timestamp insert_article() just stamped onto the
+            # row, so the Notion push below has a value to write into the
+            # `created_at` column. Sub-second drift is harmless.
+            record["created_at"] = datetime.now().isoformat(timespec="seconds")
             print(f"[db] inserted {unique_id} status=REVIEWING")
         except Exception as exc:
             print(f"[db insert failed] {url}: {exc}")

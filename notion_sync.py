@@ -18,6 +18,12 @@ The Notion database is expected to have these properties (names must
 match EXACTLY -- snake_case, see the README of Step A). Run this module
 directly (``python notion_sync.py``) to compare your DB schema against
 this expected set.
+
+Notion data model (2025-09-03+): a "database" is a container that owns
+one or more "data sources". Rows, properties, and queries all live on a
+data source, not on the database. For single-source DBs (our case), we
+auto-resolve the data source id from NOTION_DB_ID on first use; set
+NOTION_DS_ID explicitly only if your DB has more than one source.
 """
 
 import json
@@ -28,7 +34,12 @@ from notion_client import Client
 from notion_client.errors import APIResponseError
 
 from db import ArticleStatus
-from settings.config import NOTION_DB_ID, NOTION_SYNC_ENABLED, NOTION_TOKEN
+from settings.config import (
+    NOTION_DB_ID,
+    NOTION_DS_ID,
+    NOTION_SYNC_ENABLED,
+    NOTION_TOKEN,
+)
 
 # Notion limits each rich_text property value to 2000 chars. We leave a
 # 100-char margin for the "..." ellipsis we append on truncation.
@@ -44,6 +55,14 @@ _API_PAUSE_S = 0.35
 _STATUS_WHITELIST: set[str] = {s.value for s in ArticleStatus}
 _TAG_WHITELIST: set[str] = {"MARKET", "MENTOR", "REPORT", "VISA", "CITY"}
 
+# Target the current stable Notion API. 2026-03-11 renamed `archived` to
+# `in_trash` and tweaked block insertion semantics -- neither of which we
+# touch -- and 2025-09-03 introduced the data_source split that the rest
+# of this module is written against. See:
+#   https://developers.notion.com/guides/get-started/upgrade-guide-2026-03-11
+#   https://developers.notion.com/guides/get-started/upgrade-guide-2025-09-03
+_NOTION_API_VERSION = "2026-03-11"
+
 # The exact property names the Notion DB must expose. Used by the schema
 # checker (run ``python notion_sync.py``) and is the canonical mapping
 # document for the integration.
@@ -56,6 +75,7 @@ _EXPECTED_PROPERTIES: dict[str, str] = {
     "hash_code": "rich_text",
     "status": "select",
     "tag": "select",
+    "tag_reason": "rich_text",
     "article_url": "url",
     "source_url": "url",
     "source_name": "rich_text",
@@ -63,6 +83,7 @@ _EXPECTED_PROPERTIES: dict[str, str] = {
     "country": "rich_text",
     "published_at": "date",
     "scraped_at": "date",
+    "created_at": "date",
     "read_minutes": "number",
     "relevance_score": "number",
     "quality_score": "number",
@@ -74,7 +95,13 @@ _EXPECTED_PROPERTIES: dict[str, str] = {
     "stage_errors": "rich_text",
 }
 
+# Properties we tolerate in Notion but never write to. ``last_edited_time``
+# is auto-managed by Notion and will reject any API write. Anything listed
+# here is hidden from the "Extra properties" warning of the schema check.
+_SYSTEM_MANAGED_PROPERTIES: set[str] = {"updated_at"}
+
 _client: Client | None = None
+_data_source_id: str | None = None
 
 
 def _get_client() -> Client:
@@ -83,8 +110,52 @@ def _get_client() -> Client:
     if _client is None:
         if not NOTION_TOKEN:
             raise RuntimeError("NOTION_TOKEN is not set; cannot reach Notion API")
-        _client = Client(auth=NOTION_TOKEN)
+        _client = Client(auth=NOTION_TOKEN, notion_version=_NOTION_API_VERSION)
     return _client
+
+
+def _get_data_source_id() -> str:
+    """Resolve and cache the data_source_id backing NOTION_DB_ID.
+
+    Resolution order:
+        1. If NOTION_DS_ID is set in the environment, use it as-is. This
+           is the escape hatch for multi-source databases where there's
+           no single "right" data source to pick.
+        2. Otherwise call ``databases.retrieve`` and use the first (and,
+           for our DBs, only) child ``data_sources`` entry. We cache the
+           result in-process so the lookup runs at most once per run.
+
+    Raises:
+        RuntimeError: if NOTION_DB_ID is unset, or the database has zero
+            data sources (which should never happen for a real Notion
+            database).
+    """
+    global _data_source_id
+    if _data_source_id is not None:
+        return _data_source_id
+
+    if NOTION_DS_ID:
+        _data_source_id = NOTION_DS_ID
+        return _data_source_id
+
+    if not NOTION_DB_ID:
+        raise RuntimeError("NOTION_DB_ID is not set; cannot resolve data_source_id")
+
+    client = _get_client()
+    db_info = client.databases.retrieve(database_id=NOTION_DB_ID)
+    sources = db_info.get("data_sources") or []
+    if not sources:
+        raise RuntimeError(
+            f"Notion database {NOTION_DB_ID} has no data_sources; cannot proceed"
+        )
+    if len(sources) > 1:
+        names = ", ".join(f"{s.get('name')!r} ({s.get('id')})" for s in sources)
+        print(
+            f"[notion] WARN: NOTION_DB_ID {NOTION_DB_ID} has {len(sources)} data "
+            f"sources [{names}]. Using the first one. Set NOTION_DS_ID to pin."
+        )
+    _data_source_id = sources[0]["id"]
+    return _data_source_id
 
 
 # --------------------- Property builders ---------------------
@@ -158,6 +229,7 @@ def _to_props(record: dict[str, Any]) -> dict[str, Any]:
         "hash_code": _rich(record.get("hash_code")),
         "status": _select(record.get("status"), _STATUS_WHITELIST),
         "tag": _select(record.get("tag"), _TAG_WHITELIST),
+        "tag_reason": _rich(record.get("tag_reason")),
         "article_url": _url(record.get("article_url")),
         "source_url": _url(record.get("source_url")),
         "source_name": _rich(record.get("source_name")),
@@ -165,6 +237,7 @@ def _to_props(record: dict[str, Any]) -> dict[str, Any]:
         "country": _rich(record.get("country")),
         "published_at": _date(record.get("published_at")),
         "scraped_at": _date(record.get("scraped_at")),
+        "created_at": _date(record.get("created_at")),
         "read_minutes": _number(record.get("read_minutes")),
         "relevance_score": _number(record.get("relevance_score")),
         "quality_score": _number(record.get("quality_score")),
@@ -181,8 +254,8 @@ def _to_props(record: dict[str, Any]) -> dict[str, Any]:
 def _find_page_by_unique_id(unique_id: str) -> str | None:
     """Return the Notion page id whose ``unique_id`` property equals the arg."""
     client = _get_client()
-    resp = client.databases.query(
-        database_id=NOTION_DB_ID,
+    resp = client.data_sources.query(
+        data_source_id=_get_data_source_id(),
         filter={
             "property": "unique_id",
             "rich_text": {"equals": unique_id},
@@ -219,7 +292,10 @@ def push_article(record: dict[str, Any]) -> str | None:
             action = "updated"
         else:
             resp = client.pages.create(
-                parent={"database_id": NOTION_DB_ID},
+                parent={
+                    "type": "data_source_id",
+                    "data_source_id": _get_data_source_id(),
+                },
                 properties=props,
             )
             action = "created"
@@ -236,15 +312,18 @@ def push_article(record: dict[str, Any]) -> str | None:
 
 # --------------------- Pull (Notion -> pipeline) ---------------------
 def _iter_all_pages():
-    """Yield every page in the configured Notion DB, handling pagination."""
+    """Yield every page in the configured Notion data source, paginated."""
     client = _get_client()
+    data_source_id = _get_data_source_id()
     cursor: str | None = None
     while True:
-        resp = client.databases.query(
-            database_id=NOTION_DB_ID,
-            start_cursor=cursor,
-            page_size=100,
-        )
+        kwargs: dict[str, Any] = {
+            "data_source_id": data_source_id,
+            "page_size": 100,
+        }
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        resp = client.data_sources.query(**kwargs)
         for page in resp.get("results", []):
             yield page
         if not resp.get("has_more"):
@@ -304,8 +383,21 @@ def pull_status_changes(local_statuses: dict[str, str]) -> list[dict[str, str]]:
 
 
 # --------------------- Schema sanity check (dev tool) ---------------------
+def _fetch_data_source_properties() -> dict[str, dict[str, Any]]:
+    """Fetch the properties (column schema) of our configured data source.
+
+    Under 2025-09-03+ properties live on the data source object, not on
+    the database. ``databases.retrieve`` returns only the database
+    container (title, parent, child data_sources list); the actual
+    schema requires ``data_sources.retrieve``.
+    """
+    client = _get_client()
+    ds_info = client.data_sources.retrieve(data_source_id=_get_data_source_id())
+    return ds_info.get("properties", {}) or {}
+
+
 def check_schema() -> tuple[list[str], list[str], list[str]]:
-    """Compare expected vs. actual Notion DB schema.
+    """Compare expected vs. actual Notion data source schema.
 
     Returns ``(missing, extra, type_mismatches)``. Each list contains
     human-readable lines suitable for printing.
@@ -314,9 +406,7 @@ def check_schema() -> tuple[list[str], list[str], list[str]]:
         raise RuntimeError(
             "NOTION_TOKEN / NOTION_DB_ID must be set to run schema check"
         )
-    client = _get_client()
-    db_info = client.databases.retrieve(database_id=NOTION_DB_ID)
-    actual = db_info.get("properties", {})
+    actual = _fetch_data_source_properties()
     actual_types = {name: meta.get("type") for name, meta in actual.items()}
 
     missing: list[str] = []
@@ -332,16 +422,111 @@ def check_schema() -> tuple[list[str], list[str], list[str]]:
             )
 
     for name in actual_types:
-        if name not in _EXPECTED_PROPERTIES:
-            extra.append(f"  - {name}   (type: {actual_types[name]})")
+        if name in _EXPECTED_PROPERTIES or name in _SYSTEM_MANAGED_PROPERTIES:
+            continue
+        extra.append(f"  - {name}   (type: {actual_types[name]})")
 
     return missing, extra, type_mismatches
 
 
 def _print_schema_report() -> None:
-    print(f"Checking Notion DB schema (db_id={NOTION_DB_ID})...\n")
-    missing, extra, mismatches = check_schema()
+    """Print a diagnostic report for the configured Notion database.
 
+    Prints (in order):
+        1. The database container info (object type, title, child
+           data_sources list). This is the part that tells you whether
+           you're hitting the right database at all.
+        2. The data source info (which one we picked, how many columns).
+        3. The comparison against ``_EXPECTED_PROPERTIES`` (missing /
+           type-mismatched / extra columns).
+    """
+    if not NOTION_SYNC_ENABLED:
+        print(
+            "NOTION_TOKEN or NOTION_DB_ID is not set in .env; "
+            "schema check cannot run."
+        )
+        return
+
+    print(f"Checking Notion DB schema (db_id={NOTION_DB_ID})...\n")
+
+    client = _get_client()
+    try:
+        db_info = client.databases.retrieve(database_id=NOTION_DB_ID)
+    except APIResponseError as exc:
+        print(f"FAILED to retrieve database: {exc.code}: {exc}")
+        print("\nLikely causes:")
+        print("  - NOTION_DB_ID is wrong (must be the 32-char hex of the DB itself,")
+        print("    NOT a parent page that contains an inline database).")
+        print("  - The DB is not shared with your integration: open the DB,")
+        print("    click '...' (top-right) -> Connections -> add your integration.")
+        print("  - NOTION_TOKEN belongs to a different workspace than the DB.")
+        return
+    except Exception as exc:
+        print(f"FAILED to retrieve database: {exc}")
+        return
+
+    # --- Phase 1: dump the database container info ------------------------
+    obj_type = db_info.get("object")
+    title_arr = db_info.get("title") or []
+    title = "".join(t.get("plain_text", "") for t in title_arr) or "(untitled)"
+    sources = db_info.get("data_sources") or []
+
+    print(f"  object type  : {obj_type}")
+    print(f"  title        : {title}")
+    print(f"  data_sources : {len(sources)}")
+    for src in sources:
+        print(f"    - {src.get('name')!r}  id={src.get('id')}")
+    print()
+
+    if obj_type and obj_type != "database":
+        print(
+            f"WARNING: object type is '{obj_type}', not 'database'. The ID in "
+            "your NOTION_DB_ID is probably a page, not a database."
+        )
+        print()
+
+    if not sources:
+        print(
+            "WARNING: Notion returned 0 data_sources for this database. "
+            "Cannot run schema check."
+        )
+        return
+
+    # --- Phase 2: fetch the chosen data source's properties --------------
+    try:
+        ds_id = _get_data_source_id()
+        ds_info = client.data_sources.retrieve(data_source_id=ds_id)
+    except APIResponseError as exc:
+        print(f"FAILED to retrieve data source: {exc.code}: {exc}")
+        return
+    except Exception as exc:
+        print(f"FAILED to retrieve data source: {exc}")
+        return
+
+    actual = ds_info.get("properties", {}) or {}
+    actual_types = {name: meta.get("type") for name, meta in actual.items()}
+
+    ds_title_arr = ds_info.get("title") or []
+    ds_title = (
+        "".join(t.get("plain_text", "") for t in ds_title_arr) or "(untitled)"
+    )
+    print(f"Inspecting data_source '{ds_title}' (id={ds_id})")
+    print(f"  properties : {len(actual_types)} column(s)\n")
+
+    if actual_types:
+        print("Actual properties found in Notion:")
+        for name in sorted(actual_types.keys()):
+            print(f"  - {name!r:<32}  type: {actual_types[name]}")
+        print()
+    else:
+        print(
+            "WARNING: Notion returned 0 properties on this data source. "
+            "Double-check that NOTION_DB_ID / NOTION_DS_ID point at the "
+            "right object.\n"
+        )
+
+    # --- Phase 3: compare against expected schema -------------------------
+    missing, extra, mismatches = check_schema()
     if not missing and not extra and not mismatches:
         print("OK: every expected property is present with the right type.")
         return
