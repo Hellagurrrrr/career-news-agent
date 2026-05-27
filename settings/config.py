@@ -22,6 +22,16 @@ SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "5"))
 # the per-run output/ directory because it accumulates across runs.
 DB_PATH = os.getenv("DB_PATH", "articles.db")
 
+# Notion sync (optional). The local SQLite store is always the source of
+# truth; Notion is a mirror for human review + admin UI. When either of
+# these is missing we just skip Notion calls everywhere -- the pipeline
+# still runs end-to-end locally.
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+if not NOTION_TOKEN:
+    raise SystemExit("NOTION_TOKEN is not set")
+NOTION_DB_ID = os.getenv("NOTION_DB_ID")
+NOTION_SYNC_ENABLED = bool(NOTION_TOKEN and NOTION_DB_ID)
+
 # Concurrency knobs for the I/O-bound pipeline stages. All external calls
 # (Firecrawl /map, Firecrawl /scrape, DeepSeek LLM) are network-bound, so a
 # small thread pool gives a big speedup. Tune these via env vars if Firecrawl

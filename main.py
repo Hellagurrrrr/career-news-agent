@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 import db
+import notion_sync
 from crawler import map_sources_from_yaml, scrape_links_to_table
 from logger import pipeline_logger
 from raw_process_agent import raw_process_agent
@@ -15,6 +16,7 @@ from settings.config import (
     LLM_MAX_WORKERS,
     MAP_MAX_WORKERS,
     MAX_LINKS,
+    NOTION_SYNC_ENABLED,
 )
 
 
@@ -121,9 +123,8 @@ async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 f"needs_revision={needs_rev}"
             )
 
-        # Persist immediately. We catch IntegrityError separately so a
-        # race between two concurrent runs picking the same article does
-        # not crash the whole batch.
+        # Persist locally first -- this is the source of truth. We catch
+        # broadly so one bad row never aborts the batch.
         try:
             unique_id = db.insert_article(record)
             record["unique_id"] = unique_id
@@ -131,6 +132,15 @@ async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             print(f"[db] inserted {unique_id} status=REVIEWING")
         except Exception as exc:
             print(f"[db insert failed] {url}: {exc}")
+            records.append(record)
+            continue
+
+        # Mirror to Notion. push_article never raises -- it logs and
+        # returns None on failure, so a Notion outage cannot break the
+        # local pipeline. Pushed off the event loop because the SDK is
+        # synchronous (~200-500ms per call).
+        if NOTION_SYNC_ENABLED:
+            await asyncio.to_thread(notion_sync.push_article, record)
 
         records.append(record)
     return records
