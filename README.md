@@ -3,9 +3,9 @@
 > An editorial-grade content sourcing pipeline for [community web name](webLink) —
 > a curated career community for international students.
 
-This is a standalone tool that discovers, filters, summarizes and queues
-high-signal articles for the **Insights** section of the [name to be defined] Careers
-website. It is **not** a generic web crawler. It is designed as a
+This is a standalone tool that discovers, scrapes, scores, tags and queues
+high-signal articles for the **Insights** section of the [name to be defined]
+Careers website. It is **not** a generic web crawler. It is designed as a
 semi-automated *editorial assistant* that respects publishers, prefers
 quality over volume, and always keeps a human in the loop.
 
@@ -13,9 +13,9 @@ quality over volume, and always keeps a human in the loop.
 
 ## Why this exists
 
-[name to be defined]'s audience is international students targeting roles at top-tier
-banks, consultancies and tech firms. The Insights board therefore needs
-content that is:
+[name to be defined]'s audience is international students targeting roles at
+top-tier banks, consultancies and tech firms. The Insights board therefore
+needs content that is:
 
 - **Timely** — hiring signals, comp data, visa policy shifts
 - **Specific** — written for graduates pursuing global careers
@@ -27,84 +27,317 @@ last 20% — review, voice, and publishing.
 
 ---
 
-## Architecture (MVP)
+## Architecture
 
 ```
-┌──────────────┐   ┌───────────┐   ┌─────────────────┐   ┌────────┐
-│ sources.yaml │──▶│ Firecrawl │──▶│  LLM Pipeline   │──▶│ Notion │
-│  (whitelist) │   │  /scrape  │   │ score → summary │   │   DB   │
-└──────────────┘   └───────────┘   └─────────────────┘   └────────┘
-                          │                                   │
-                          ▼                                   ▼
-                  ┌──────────────┐                     ┌─────────────┐
-                  │ local SQLite │                     │  Editorial  │
-                  │ (dedupe log) │                     │   review    │
-                  └──────────────┘                     └─────────────┘
+┌──────────────┐   ┌───────────────┐   ┌──────────────────────────────┐   ┌──────────────┐   ┌────────┐
+│ sources/     │──▶│   Firecrawl   │──▶│  SQLite dedupe (hash_code)   │──▶│  LangGraph   │──▶│ SQLite │
+│ source.yaml  │   │  /map +/scrape│   │  drop rows already processed │   │  4-node agent│   │ (SoT)  │
+└──────────────┘   └───────────────┘   └──────────────────────────────┘   └──────┬───────┘   └───┬────┘
+                                                                                 │               │
+                                                                                 ▼               ▼
+                                                                          ┌─────────────┐  ┌──────────────┐
+                                                                          │ output/<ts>/│  │ Feishu       │
+                                                                          │ articles+   │  │ Bitable      │
+                                                                          │ metrics.json│  │ (mirror &    │
+                                                                          │             │  │  review UI)  │
+                                                                          └─────────────┘  └──────┬───────┘
+                                                                                                  │
+                                                                                                  ▼
+                                                                                          ┌───────────────┐
+                                                                                          │  sync_back.py │
+                                                                                          │ pulls status  │
+                                                                                          │ changes back  │
+                                                                                          └───────────────┘
 ```
 
-**Stage 1 — Discovery.** Sources are declared in `sources.yaml`. Each entry
-is either an RSS feed, a sitemap URL, or a Firecrawl `/search` query.
+**Stage 1 — Discovery (`crawler.map_sources_from_yaml`).** Sources are
+declared in `sources/source.yaml`. Each entry uses Firecrawl `/map` against
+a landing page (e.g. `https://www.jpmorgan.com/insights`). The discovered
+URLs are filtered per-source by a regex `url_pattern`, with asset URLs
+(`.pdf`, `.jpg`, `.mp4`, …) and the landing page itself dropped.
 
-**Stage 2 — Fetch.** New URLs are fetched via Firecrawl `/scrape` and
-returned as clean Markdown. RSS-only sources skip Firecrawl entirely.
+**Stage 2 — Fetch (`crawler.scrape_links_to_table`).** Filtered URLs are
+fetched via Firecrawl `/scrape` and returned as clean Markdown, fanned out
+across `SCRAPE_MAX_WORKERS` threads per source.
 
-**Stage 3 — Dedupe.** A canonical-URL hash and a content fingerprint are
-checked against a local SQLite log. Anything seen before is dropped.
+**Stage 3 — Dedupe (`db.compute_hash` + `db.existing_hashes`).** Each row
+gets a SHA-256 of its normalized `article_url`. Anything already in
+`articles.db` is dropped *before* the LLM stage, so we never spend tokens
+on a re-scrape.
 
-**Stage 4 — LLM triage (two passes).**
+**Stage 4 — LLM agent (`raw_process_agent`, LangGraph, DeepSeek).** Every
+surviving row runs through a 4-node graph:
 
-1. **Relevance scoring** (`gpt-4o-mini`) — outputs a 0–10 score and a
-  short rationale. Items below the threshold are discarded.
-2. **Editorial pass** (`gpt-4o` or equivalent) — produces a tag
-  (`MARKET` / `MENTOR` / `REPORT`), a bilingual headline (zh + en) and a
-   bilingual excerpt of ≤ 200 characters each.
+1. **`extract`** — pulls `title_zh/en`, `excerpt_zh/en`, `author`,
+   `country`, `published_at`, `read_minutes`, `notes` from the raw
+   markdown (structured output via Pydantic).
+2. **`score`** — independent `relevance_score` and `quality_score` on a
+   0–10 rubric (see `settings/config.py::SCORE_CRITERIA`). `overall_score`
+   is computed deterministically in Python as their rounded mean.
+3. **`generate_tag`** — picks exactly one of `MARKET` / `MENTOR` /
+   `REPORT` / `VISA` / `CITY`, plus a short `tag_reason`.
+4. **`review`** — re-reads the source markdown and cross-checks every
+   extracted field, producing a corrected record plus `needs_revision`
+   and `review_notes`.
 
-**Stage 5 — Publish to Notion.** Survivors are written to a Notion
-database with `Status = Pending Review`. Editors approve or reject inside
-Notion.
+Each node catches its own LLM errors into `stage_errors` so one bad call
+never aborts the article.
 
-> The Notion database is currently the **single source of truth**. A future
-> milestone introduces a Postgres mirror so that the main website can
-> consume content via a dedicated API instead of polling Notion.
+**Stage 5 — Persist + mirror.** Every completed record is:
+
+- Inserted into the local **SQLite** store (`articles.db`) with
+  `status = REVIEWING`. SQLite is the **single source of truth**.
+- Optionally pushed to **Feishu Bitable** (`feishu_sync.push_article`)
+  as a cloud admin UI for editors. Feishu failures are logged and
+  swallowed — they never break the local pipeline.
+- Dumped to `output/<timestamp>/articles.json` plus
+  `output/<timestamp>/metrics.json` for that run.
+
+**Stage 6 — Reverse sync (`sync_back.py`).** Editors flip rows in the
+Feishu Bitable between `REVIEWING → READY → PUBLISHED` (or `DISCARD`).
+Running `python sync_back.py` walks the Bitable, diffs against the local
+DB, and promotes any status changes back into SQLite.
 
 ---
 
-## Notion database schema
+## Quick start
 
-The schema is intentionally aligned with the card fields rendered on the
-Meridian website (`card-title`, `card-excerpt`, `tag`, `card-meta`,
-`card-footer`), so future website integration is a straight mapping.
+### 1. Install dependencies
 
+```bash
+pip install firecrawl-py langchain-deepseek langgraph langchain-core \
+            lark-oapi pandas pyyaml python-dotenv pydantic
+```
 
-| Property          | Type          | Purpose                                                                                                                                                                                                             |
-| ----------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Title ZH`        | Title         | Chinese headline (rewritten by LLM)                                                                                                                                                                                 |
-| `Title EN`        | Rich text     | English headline                                                                                                                                                                                                    |
-| `Excerpt ZH`      | Rich text     | ≤ 200 chars                                                                                                                                                                                                         |
-| `Excerpt EN`      | Rich text     | ≤ 200 chars                                                                                                                                                                                                         |
-| `Tag`             | Select        | `MARKET` / `MENTOR` / `REPORT` / `VISA` / `CITY`                                                                                                                                                                    |
-| `Status`          | Status        | `Pending Review` → `Approved` → `Rejected` → `Published`                                                                                                                                                            |
-| `Relevance Score` | Number        | 0–10, used to sort the review queue                                                                                                                                                                                 |
-| `Source URL`      | URL           | Canonical link to the original article                                                                                                                                                                              |
-| `Source Name`     | Select        | Publisher (e.g. *eFinancialCareers*)                                                                                                                                                                                |
-| `Author`          | Rich text     | Original byline                                                                                                                                                                                                     |
-| `Country`         | Multi-select  | Countries this article is relevant to. Used for geo-based filtering of the Insights feed. Constrained to a curated enum (e.g. United States, United Kingdom, Hong Kong SAR, Singapore, Mainland China, Global).     |
-| `City`            | Multi-select  | Cities or financial hubs this article is relevant to. Aligned with Meridian's rotation cities (New York, London, Hong Kong, Singapore, Shanghai) plus editorially-added hubs. Leave empty for country-level pieces. |
-| `Published At`    | Date          | Original publication time                                                                                                                                                                                           |
-| `Scraped At`      | Date          | Time this row was created                                                                                                                                                                                           |
-| `Read Minutes`    | Number        | Estimated reading time                                                                                                                                                                                              |
-| `Cover Image`     | Files & media | External URL (no direct uploads)                                                                                                                                                                                    |
-| `Content Hash`    | Rich text     | SHA-1 fingerprint for dedupe (hidden)                                                                                                                                                                               |
-| `Raw Markdown`    | Rich text     | Original scraped Markdown (hidden, replayable)                                                                                                                                                                      |
-| `Notes`           | Rich text     | Editorial annotations                                                                                                                                                                                               |
+### 2. Configure environment
 
-### Tag Clarification:
+Create a `.env` in the repo root and fill in:
 
-- `MARKET`: The "market conditions" of the recruitment market. For example, the recruitment pace of tech giants in Q2 and the segmented recruitment of hedge funds on campus, which belong to macro/meta-level industry trend observations.
-- `MENTOR`: First-person experience articles from current mentors in the industry, such as letters from Goldman Sachs IBD and McKinsey EM, which focus on personal know-how.
-- `REPORT`: Structured data reports, such as the "2026 White Paper on Job Seeking for International Students" and the "Comprehensive Report on Careers for Female International Students," emphasize sample size and research dimensions, and are research content produced in-house by the community.
-- `VISA`:  Policy and compliance related content, such as new H-1B lottery rules.
-- `CITY`: Life/job-seeking guides centered around individual work cities, such as London and New York. Focus on lifestyle/local information.
+```env
+# Required
+FIRECRAWL_API_KEY=fc-...
+DEEPSEEK_API_KEY=sk-...
+
+# Feishu (Lark) Bitable mirror -- all four required to enable sync.
+# Leave any one empty to run pipeline + local SQLite only.
+FEISHU_APP_ID=cli_...
+FEISHU_APP_SECRET=...
+FEISHU_APP_TOKEN=...   # from the URL: feishu.cn/base/<APP_TOKEN>?table=...
+FEISHU_TABLE_ID=tbl... # the `table=` query param of the Bitable URL
+
+# Optional pipeline tuning (defaults shown)
+MAX_LINKS=5            # max URLs kept per source after /map filter
+MAP_MAX_WORKERS=4      # parallel Firecrawl /map calls
+SCRAPE_MAX_WORKERS=8   # parallel /scrape calls per source
+LLM_MAX_WORKERS=6      # parallel DeepSeek calls in the agent stage
+DB_PATH=articles.db    # SQLite file path (relative to repo root)
+```
+
+How to get the Feishu credentials:
+
+1. Create a **custom app** on <https://open.feishu.cn/app>.
+2. Under *Permissions & Scopes*, grant the `bitable:app` scope
+   (read + write). Publish a version of the app so the scope takes effect.
+3. Copy `App ID` + `App Secret` from the app's *Credentials & Basic Info*.
+4. Open the target Bitable; copy the `<APP_TOKEN>` and `<TABLE_ID>` out
+   of the URL (`feishu.cn/base/<APP_TOKEN>?table=<TABLE_ID>`).
+5. In the Bitable, click `...` → *Share* → add the custom app as a
+   collaborator with **Can edit** permission.
+
+> Bitable fields are validated lazily. To verify your Bitable has the
+> right columns before the first real run, do `python feishu_sync.py` —
+> it prints the actual schema and lists any missing / mismatched fields.
+
+### 3. (Optional) Edit the source whitelist
+
+Add or remove publishers in `sources/source.yaml`:
+
+```yaml
+- name: Goldman Sachs Careers Blog
+  type: map
+  url: https://www.goldmansachs.com/careers/blog
+  url_pattern: ^https?://(?:www\.)?goldmansachs\.com/careers/blog/.+
+```
+
+`url_pattern` is a Python regex applied to every link `/map` returns. Use
+it to drop nav pages, tag indexes, social embeds, etc.
+
+### 4. Run the pipeline
+
+```bash
+python main.py
+```
+
+This will, in one pass: map → scrape → dedupe → run the 4-node agent →
+insert into SQLite → mirror to Feishu Bitable → write the per-run
+snapshot to `output/<YYYYMMDD_HHMMSS>/`.
+
+### 5. Sync editor decisions back
+
+After editors change `status` in the Feishu Bitable:
+
+```bash
+python sync_back.py
+```
+
+---
+
+## Local SQLite schema (`articles` table)
+
+The local DB is the source of truth. See `db.py` for the canonical DDL.
+
+| Column            | Type    | Notes                                                                                |
+| ----------------- | ------- | ------------------------------------------------------------------------------------ |
+| `unique_id`       | TEXT PK | UUID4 hex, assigned by `db.insert_article`                                           |
+| `hash_code`       | TEXT    | SHA-256 of normalized `article_url`; UNIQUE; the dedupe key                          |
+| `status`          | TEXT    | `REVIEWING` / `READY` / `PUBLISHED` / `DISCARD` (enforced by CHECK)                  |
+| `article_url`     | TEXT    | Canonical URL of the scraped article                                                 |
+| `source_name`     | TEXT    | Display name from `source.yaml`                                                      |
+| `source_url`      | TEXT    | Landing-page URL from `source.yaml`                                                  |
+| `scraped_at`      | TEXT    | ISO-8601 timestamp when Firecrawl returned the markdown                              |
+| `raw_markdown`    | TEXT    | Original Firecrawl markdown (kept so the agent is replayable)                        |
+| `title_zh/en`     | TEXT    | Bilingual title from the `extract` node                                              |
+| `excerpt_zh/en`   | TEXT    | Bilingual excerpt (~500 chars target)                                                |
+| `author`          | TEXT    | Original byline                                                                      |
+| `country`         | TEXT    | Country the article is about / from                                                  |
+| `published_at`    | TEXT    | Original publication time (string, as extracted)                                     |
+| `read_minutes`    | INTEGER | Estimated reading time                                                               |
+| `notes`           | TEXT    | Free-form notes from `extract`                                                       |
+| `tag`             | TEXT    | One of `MARKET` / `MENTOR` / `REPORT` / `VISA` / `CITY` (CHECK)                      |
+| `tag_reason`      | TEXT    | Short rationale for the chosen tag                                                   |
+| `relevance_score` | INTEGER | 0–10, from `score` node                                                              |
+| `quality_score`   | INTEGER | 0–10, from `score` node                                                              |
+| `overall_score`   | INTEGER | `round((relevance + quality) / 2)`; computed in Python, not by the LLM               |
+| `reason`          | TEXT    | Rationale for the scores                                                             |
+| `needs_revision`  | INTEGER | 0/1 — whether the `review` node corrected any field                                  |
+| `review_notes`    | TEXT    | Short Chinese note describing review changes                                         |
+| `stage_errors`    | TEXT    | JSON array of `{node, error}` for any node that failed                               |
+| `created_at`      | TEXT    | ISO-8601, set on insert                                                              |
+| `updated_at`      | TEXT    | ISO-8601, refreshed by admin ops (`update_status`, `update_tag`)                     |
+
+### Lifecycle (`ArticleStatus`)
+
+| Status      | Set by         | Meaning                                                          |
+| ----------- | -------------- | ---------------------------------------------------------------- |
+| `REVIEWING` | pipeline       | Default after insert; waiting for editor review in Feishu        |
+| `READY`     | editor → sync  | Approved; ready to publish on the community site                 |
+| `PUBLISHED` | editor → sync  | Live on the community site                                       |
+| `DISCARD`   | editor → sync  | Unusable; kept for dedupe history but never surfaced             |
+
+### Tags (`ArticleTag`)
+
+- **`MARKET`** — macro/meta-level industry trend observations on the
+  recruitment market (e.g. tech giants' Q2 hiring pace, hedge-fund campus
+  recruiting cadence).
+- **`MENTOR`** — first-person know-how from current industry mentors
+  (e.g. a Goldman IBD analyst's letter, a McKinsey EM's playbook).
+- **`REPORT`** — in-house structured data reports emphasizing sample size
+  and research dimensions (e.g. the 2026 International Student Job
+  Seeking White Paper).
+- **`VISA`** — policy / compliance content (e.g. new H-1B lottery rules).
+- **`CITY`** — life and job-seeking guides centered on a single work city
+  (London, New York, …), focused on lifestyle / local info.
+
+---
+
+## Feishu Bitable mirror schema
+
+The Feishu Bitable is treated as a thin cloud admin UI on top of the
+local SQLite store. Field names must match exactly (snake_case) so
+`feishu_sync.push_article` can upsert without translation. The full
+expected schema lives in `feishu_sync._EXPECTED_FIELDS`; running
+`python feishu_sync.py` will diff your live Bitable against it.
+
+> **Order matters when creating the table for the first time.** Bitable
+> auto-promotes the first text column to the table's *primary field*
+> (the bold, mandatory first column). Create `title_zh` first so it
+> claims that slot.
+
+| Field             | Bitable type    | Source field         |
+| ----------------- | --------------- | -------------------- |
+| `title_zh`        | text (primary)  | `title_zh`           |
+| `title_en`        | text            | `title_en`           |
+| `excerpt_zh`      | text            | `excerpt_zh`         |
+| `excerpt_en`      | text            | `excerpt_en`         |
+| `unique_id`       | text            | `unique_id`          |
+| `hash_code`       | text            | `hash_code`          |
+| `status`          | single_select   | `status` (one of 4)  |
+| `tag`             | single_select   | `tag` (one of 5)     |
+| `tag_reason`      | text            | `tag_reason`         |
+| `article_url`     | url             | `article_url`        |
+| `source_url`      | url             | `source_url`         |
+| `source_name`     | text            | `source_name`        |
+| `author`          | text            | `author`             |
+| `country`         | text            | `country`            |
+| `published_at`    | datetime        | `published_at`       |
+| `scraped_at`      | datetime        | `scraped_at`         |
+| `created_at`      | datetime        | `created_at`         |
+| `read_minutes`    | number          | `read_minutes`       |
+| `relevance_score` | number          | `relevance_score`    |
+| `quality_score`   | number          | `quality_score`      |
+| `overall_score`   | number          | `overall_score`      |
+| `reason`          | text            | `reason`             |
+| `needs_revision`  | checkbox        | `needs_revision`     |
+| `review_notes`    | text            | `review_notes`       |
+| `notes`           | text            | `notes`              |
+| `stage_errors`    | text            | JSON-encoded         |
+
+Notes:
+
+- Uses the `lark-oapi` Python SDK targeting Bitable open API `v1`
+  (`client.bitable.v1.app_table_record.{search,create,update}` and
+  `client.bitable.v1.app_table_field.list`).
+- Each text value is truncated to ~1900 chars to keep payloads light
+  and grid views readable, even though Bitable accepts ~100k chars per
+  cell.
+- All three `*_at` columns are written as **millisecond epoch
+  integers**, the native Bitable datetime format. ISO-8601 strings from
+  the pipeline are converted in `_to_epoch_ms` before being pushed.
+- `status` and `tag` are validated against a client-side whitelist so
+  an LLM hallucination cannot pollute Bitable's auto-grown select
+  options.
+
+---
+
+## Per-run output
+
+Each invocation of `python main.py` creates `output/<YYYYMMDD_HHMMSS>/`
+containing:
+
+- **`articles.json`** — every article processed in that run, in the same
+  shape that was inserted into SQLite. Handy for eyeballing one run
+  without opening sqlite.
+- **`metrics.json`** — per-stage timing and DeepSeek token usage
+  (see `logger.PipelineLogger`). Stages tracked: `map`, `scrape`,
+  `extract`, `score`, `generate_tag`, `review`.
+
+A human-readable version of `metrics.json` is also printed at the end of
+every run.
+
+---
+
+## Project layout
+
+```
+career-news-agent/
+├── main.py                # async pipeline orchestrator
+├── crawler.py             # Firecrawl /map + /scrape
+├── raw_process_agent.py   # 4-node LangGraph agent (DeepSeek)
+├── db.py                  # SQLite persistence (source of truth)
+├── feishu_sync.py         # push to Feishu Bitable + schema checker
+├── sync_back.py           # pull editor status changes from Feishu
+├── llm.py                 # DeepSeek client factory
+├── logger.py              # per-stage timing + token logger
+├── settings/
+│   └── config.py          # env-var loading + scoring rubric
+├── sources/
+│   └── source.yaml        # publisher whitelist
+├── output/<run-ts>/       # per-run articles.json + metrics.json (gitignored)
+├── articles.db            # local SQLite store (gitignored)
+├── .env
+└── README.md
+```
 
 ---
 
@@ -115,13 +348,14 @@ republish**.
 
 - `robots.txt` is always respected (Firecrawl enforces this by default).
 - Whitelist-only — no opportunistic crawling of arbitrary domains.
-- Excerpts are LLM-rewritten and capped at ~200 characters; the full
-article is **never** stored on the public website.
-- Every published card links to the original source with attribution.
+- Excerpts are LLM-rewritten; the full article is never stored on the
+  public website (the raw markdown is kept locally only for replayability
+  of the agent stage).
+- Every published card links back to the original source with attribution.
 - Paywalled publications (WSJ, FT, Bloomberg, etc.) are limited to
-metadata + outbound links — no paywall circumvention, ever.
-- The crawler identifies itself with a descriptive `User-Agent` and a
-contact email so publishers can reach us.
+  metadata + outbound links — no paywall circumvention, ever.
+- The crawler identifies itself with Firecrawl's default User-Agent and a
+  contact email so publishers can reach us.
 
 If you are a publisher and would like us to stop ingesting your content,
 email `editorial@meridian.careers` and we will remove the source within
@@ -133,27 +367,29 @@ one business day.
 
 **v0.1 — MVP (current)**
 
-- Whitelist + Firecrawl
-- Two-pass LLM pipeline
-- Notion as single source of truth
-- Manual review workflow
+- Firecrawl-based whitelist crawler
+- 4-node DeepSeek agent (extract / score / generate_tag / review)
+- Local SQLite as source of truth + JSON snapshot per run
+- Feishu Bitable mirror with two-way status sync
+- Per-stage timing and token metrics
 
 **v0.2 — Hardening**
 
-- Semantic deduplication via embeddings (`text-embedding-3-small`)
-- Per-source success/failure dashboards
-- Quarterly Notion archival job
+- Semantic deduplication via embeddings (in addition to URL-hash)
+- Per-source success/failure dashboards on top of `metrics.json`
+- Quarterly Bitable archival job
+- Retry/backoff on Firecrawl 429s and DeepSeek transient errors
 
 **v0.3 — Website integration**
 
-- Postgres mirror as the new source of truth
+- Postgres mirror as the new shared source of truth
 - Read-only `GET /api/news` endpoint consumed by the main site
-- Auto-publish flow for `Approved` items
+- Auto-publish flow for `READY` items
 
 **v1.0 — Editorial agent**
 
-- Background-research agent that synthesizes 2–3 related articles
-into a Meridian-original brief
+- Background-research agent that synthesizes 2–3 related articles into a
+  Meridian-original brief
 - Image suggestion via Unsplash API based on extracted entities
 - Weekly digest generator for the Editorial Weekly newsletter
 

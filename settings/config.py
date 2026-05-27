@@ -20,21 +20,27 @@ MAX_LINKS = int(os.getenv("MAX_LINKS", "5"))
 # the per-run output/ directory because it accumulates across runs.
 DB_PATH = os.getenv("DB_PATH", "articles.db")
 
-# Notion sync (optional). The local SQLite store is always the source of
-# truth; Notion is a mirror for human review + admin UI. When either of
-# these is missing we just skip Notion calls everywhere -- the pipeline
-# still runs end-to-end locally.
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-if not NOTION_TOKEN:
-    raise SystemExit("NOTION_TOKEN is not set")
-NOTION_DB_ID = os.getenv("NOTION_DB_ID")
-# Notion API 2025-09-03 split each database into a container + one or more
-# child "data sources". Reads/writes against rows now target the data
-# source, not the database. For single-source DBs (the common case) we
-# auto-resolve this from NOTION_DB_ID; set NOTION_DS_ID explicitly only if
-# your DB has multiple data sources and you need to pin a specific one.
-NOTION_DS_ID = os.getenv("NOTION_DS_ID")
-NOTION_SYNC_ENABLED = bool(NOTION_TOKEN and NOTION_DB_ID)
+# Feishu (Lark) Bitable sync (optional). The local SQLite store is always
+# the source of truth; the Bitable is a mirror for human review + admin
+# UI. When any of these are missing we just skip Feishu calls everywhere
+# -- the pipeline still runs end-to-end locally.
+#
+# Get these from the Feishu open platform (open.feishu.cn):
+#     FEISHU_APP_ID / FEISHU_APP_SECRET : credentials of a custom app
+#         with "bitable:app" read/write permission AND added as a
+#         collaborator on the target Bitable.
+#     FEISHU_APP_TOKEN : the Bitable's app_token. From the URL
+#         https://<tenant>.feishu.cn/base/<APP_TOKEN>?table=<TABLE_ID>
+#     FEISHU_TABLE_ID  : the data table id (the ``table=`` query param
+#         in the URL above). A Bitable can hold multiple tables -- this
+#         pins the one we use.
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
+FEISHU_APP_TOKEN = os.getenv("FEISHU_APP_TOKEN")
+FEISHU_TABLE_ID = os.getenv("FEISHU_TABLE_ID")
+FEISHU_SYNC_ENABLED = bool(
+    FEISHU_APP_ID and FEISHU_APP_SECRET and FEISHU_APP_TOKEN and FEISHU_TABLE_ID
+)
 
 # Concurrency knobs for the I/O-bound pipeline stages. All external calls
 # (Firecrawl /map, Firecrawl /scrape, DeepSeek LLM) are network-bound, so a

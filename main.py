@@ -8,15 +8,15 @@ from typing import Any
 import pandas as pd
 
 import db
-import notion_sync
+import feishu_sync
 from crawler import map_sources_from_yaml, scrape_links_to_table
 from logger import pipeline_logger
 from raw_process_agent import raw_process_agent
 from settings.config import (
+    FEISHU_SYNC_ENABLED,
     LLM_MAX_WORKERS,
     MAP_MAX_WORKERS,
     MAX_LINKS,
-    NOTION_SYNC_ENABLED,
 )
 
 
@@ -130,7 +130,7 @@ async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             record["unique_id"] = unique_id
             record["status"] = db.ArticleStatus.REVIEWING.value
             # Mirror the timestamp insert_article() just stamped onto the
-            # row, so the Notion push below has a value to write into the
+            # row, so the Feishu push below has a value to write into the
             # `created_at` column. Sub-second drift is harmless.
             record["created_at"] = datetime.now().isoformat(timespec="seconds")
             print(f"[db] inserted {unique_id} status=REVIEWING")
@@ -139,12 +139,12 @@ async def _process_all(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             records.append(record)
             continue
 
-        # Mirror to Notion. push_article never raises -- it logs and
-        # returns None on failure, so a Notion outage cannot break the
-        # local pipeline. Pushed off the event loop because the SDK is
-        # synchronous (~200-500ms per call).
-        if NOTION_SYNC_ENABLED:
-            await asyncio.to_thread(notion_sync.push_article, record)
+        # Mirror to Feishu Bitable. push_article never raises -- it logs
+        # and returns None on failure, so a Feishu outage cannot break
+        # the local pipeline. Pushed off the event loop because the
+        # lark-oapi SDK is synchronous (~200-500ms per call).
+        if FEISHU_SYNC_ENABLED:
+            await asyncio.to_thread(feishu_sync.push_article, record)
 
         records.append(record)
     return records

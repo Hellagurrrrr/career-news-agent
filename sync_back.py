@@ -1,26 +1,27 @@
-"""Pull admin-driven status changes from Notion back into the local DB.
+"""Pull admin-driven status changes from Feishu back into the local DB.
 
 Run periodically (manually, via cron, or as the first step of a pipeline
-run) so that articles marked READY / PUBLISHED / DISCARD in the Notion UI
-are reflected in articles.db.
+run) so that articles marked READY / PUBLISHED / DISCARD in the Feishu
+Bitable UI are reflected in articles.db.
 
 The local SQLite store stays the source of truth; this script just
-promotes human decisions made in Notion into the DB.
+promotes human decisions made in Feishu into the DB.
 
 Usage:
     python sync_back.py
 """
 
 import db
-import notion_sync
-from settings.config import NOTION_SYNC_ENABLED
+import feishu_sync
+from settings.config import FEISHU_SYNC_ENABLED
 
 
 def main() -> None:
-    if not NOTION_SYNC_ENABLED:
+    if not FEISHU_SYNC_ENABLED:
         print(
-            "[sync_back] Notion sync is disabled (NOTION_TOKEN / NOTION_DB_ID "
-            "not set). Nothing to do."
+            "[sync_back] Feishu sync is disabled (FEISHU_APP_ID / "
+            "FEISHU_APP_SECRET / FEISHU_APP_TOKEN / FEISHU_TABLE_ID not "
+            "all set). Nothing to do."
         )
         return
 
@@ -30,9 +31,9 @@ def main() -> None:
     local = {r["unique_id"]: r["status"] for r in rows}
     print(f"[sync_back] local rows: {len(local)}")
 
-    diffs = notion_sync.pull_status_changes(local)
+    diffs = feishu_sync.pull_status_changes(local)
     if not diffs:
-        print("[sync_back] no status changes from Notion.")
+        print("[sync_back] no status changes from Feishu.")
         return
 
     applied = 0
